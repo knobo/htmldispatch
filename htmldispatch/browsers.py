@@ -4,14 +4,16 @@ import configparser
 import shutil
 from pathlib import Path
 
+FIREFOX_PROFILE_DIRS = [
+    Path.home() / "snap/firefox/common/.mozilla/firefox",
+    Path.home() / ".mozilla/firefox",
+]
+
 
 def get_firefox_profiles():
     """Return list of Firefox profile names."""
     profiles = []
-    for profiles_ini in [
-        Path.home() / "snap/firefox/common/.mozilla/firefox/profiles.ini",
-        Path.home() / ".mozilla/firefox/profiles.ini",
-    ]:
+    for profiles_ini in [d / "profiles.ini" for d in FIREFOX_PROFILE_DIRS]:
         if profiles_ini.exists():
             config = configparser.ConfigParser()
             config.read(profiles_ini)
@@ -21,6 +23,27 @@ def get_firefox_profiles():
                     if name:
                         profiles.append(name)
     return profiles
+
+
+def get_firefox_profile_path(profile_name):
+    """Return the full path to a Firefox profile directory, or None."""
+    for base_dir in FIREFOX_PROFILE_DIRS:
+        profiles_ini = base_dir / "profiles.ini"
+        if profiles_ini.exists():
+            config = configparser.ConfigParser()
+            config.read(profiles_ini)
+            for section in config.sections():
+                if section.startswith("Profile"):
+                    name = config.get(section, "Name", fallback=None)
+                    if name == profile_name:
+                        path = config.get(section, "Path", fallback=None)
+                        is_relative = config.getboolean(section, "IsRelative", fallback=True)
+                        if path:
+                            if is_relative:
+                                return str(base_dir / path)
+                            return path
+    return None
+
 
 
 def get_chrome_profiles():

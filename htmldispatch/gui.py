@@ -8,8 +8,8 @@ from ttkbootstrap.dialogs import Messagebox
 
 from .browsers import get_available_browsers, get_chrome_profiles, get_firefox_profiles
 from .config import load_config, save_config
-from .dispatcher import open_url
-from .history import load_history
+from .dispatcher import open_url, resolve_destination
+from .history import get_unique_destinations, load_history
 
 
 class DispatcherApp:
@@ -53,6 +53,13 @@ class DispatcherApp:
         else:
             self.notebook.select(1)
 
+        # Keybindings
+        self.root.bind("<Control-Return>", self._do_dispatch)
+        self.root.bind("<Control-space>", self._auto_dispatch)
+        self.root.bind("<Escape>", lambda e: self.root.destroy())
+        self.root.bind("<Up>", self._on_key_up)
+        self.root.bind("<Down>", self._on_key_down)
+
     def run(self):
         self.root.mainloop()
 
@@ -67,6 +74,13 @@ class DispatcherApp:
         self.url_var = tk.StringVar(value=self.url or "")
         url_entry = ttk.Entry(frame, textvariable=self.url_var, font=("", 10))
         url_entry.pack(fill=X, padx=10, pady=5)
+
+        # Source label — shows where the suggestion came from
+        self.source_var = tk.StringVar(value="")
+        self.source_label = ttk.Label(
+            frame, textvariable=self.source_var, font=("", 9), bootstyle="info"
+        )
+        self.source_label.pack(anchor=W, padx=10)
 
         ttk.Label(frame, text="Browser:").pack(anchor=W, padx=10, pady=(10, 0))
         self.browser_var = tk.StringVar()
@@ -88,11 +102,23 @@ class DispatcherApp:
         self.profile_combo.pack(fill=X, padx=10, pady=5)
         self._update_profiles()
 
+        # Build destinations list and pre-fill
+        self._destinations = get_unique_destinations()
+        self._dest_index = -1  # -1 means "resolved suggestion", not from list
+        self._prefill_destination()
+
         btn_frame = ttk.Frame(frame)
         btn_frame.pack(fill=X, padx=10, pady=15)
 
         ttk.Button(
-            btn_frame, text="Open", bootstyle=SUCCESS, command=self._do_dispatch
+            btn_frame, text="Open (Ctrl+Enter)", bootstyle=SUCCESS, command=self._do_dispatch
+        ).pack(side=LEFT, padx=5)
+
+        ttk.Button(
+            btn_frame,
+            text="Auto (Ctrl+Space)",
+            bootstyle=PRIMARY,
+            command=self._auto_dispatch,
         ).pack(side=LEFT, padx=5)
 
         ttk.Button(
@@ -103,7 +129,7 @@ class DispatcherApp:
         ).pack(side=LEFT, padx=5)
 
         ttk.Button(
-            btn_frame, text="Cancel", bootstyle=SECONDARY, command=self.root.destroy
+            btn_frame, text="Cancel (Esc)", bootstyle=SECONDARY, command=self.root.destroy
         ).pack(side=RIGHT, padx=5)
 
     def _on_browser_change(self, event=None):
@@ -122,7 +148,62 @@ class DispatcherApp:
         if profiles:
             self.profile_combo.current(0)
 
-    def _do_dispatch(self):
+    def _set_destination(self, browser, profile):
+        """Set the browser and profile combos to given values."""
+        if browser:
+            self.browser_var.set(browser)
+            self._update_profiles()
+            self.profile_var.set(profile if profile else "(none)")
+
+    def _prefill_destination(self):
+        """Pre-fill browser/profile using the resolve fallback chain."""
+        url = self.url_var.get().strip()
+        if not url:
+            self.source_var.set("")
+            return
+        browser, profile, source = resolve_destination(url)
+        self._set_destination(browser, profile)
+        self.source_var.set(source)
+        self._dest_index = -1
+
+    def _on_key_up(self, event=None):
+        """Navigate to previous destination in history."""
+        if not self._destinations:
+            return
+        if self._dest_index < len(self._destinations) - 1:
+            self._dest_index += 1
+        self._apply_dest_from_list()
+
+    def _on_key_down(self, event=None):
+        """Navigate to next destination in history."""
+        if self._dest_index > 0:
+            self._dest_index -= 1
+            self._apply_dest_from_list()
+        elif self._dest_index == 0:
+            # Go back to resolved suggestion
+            self._dest_index = -1
+            self._prefill_destination()
+
+    def _apply_dest_from_list(self):
+        """Apply the destination at current _dest_index."""
+        if self._dest_index < 0 or self._dest_index >= len(self._destinations):
+            return
+        browser, profile = self._destinations[self._dest_index]
+        self._set_destination(browser, profile)
+        pos = self._dest_index + 1
+        total = len(self._destinations)
+        self.source_var.set(f"History ({pos}/{total})")
+
+    def _auto_dispatch(self, event=None):
+        """Dispatch URL using the resolve fallback chain."""
+        url = self.url_var.get().strip()
+        if not url:
+            return
+        browser, profile, source = resolve_destination(url)
+        open_url(url, browser, profile, source)
+        self.root.destroy()
+
+    def _do_dispatch(self, event=None):
         url = self.url_var.get().strip()
         if not url:
             return
@@ -237,6 +318,7 @@ class DispatcherApp:
         url = self._get_selected_history_url()
         if url:
             self.url_var.set(url)
+            self._prefill_destination()
             self.notebook.select(0)
 
     # ── Rules tab ─────────────────────────────────────────────────
@@ -383,6 +465,45 @@ class DispatcherApp:
         ttk.Button(
             frame, text="Save Settings", bootstyle=SUCCESS, command=self._save_settings
         ).pack(anchor=W, padx=10, pady=15)
+
+        ttk.Separator(frame).pack(fill=X, padx=10, pady=5)
+
+        self.default_status_var = tk.StringVar()
+        self._check_default_browser()
+        ttk.Label(frame, textvariable=self.default_status_var).pack(
+            anchor=W, padx=10, pady=(10, 0)
+        )
+        ttk.Button(
+            frame,
+            text="Set as default browser",
+            bootstyle=WARNING,
+            command=self._set_as_default,
+        ).pack(anchor=W, padx=10, pady=5)
+
+    def _check_default_browser(self):
+        import subprocess
+        try:
+            result = subprocess.run(
+                ["xdg-settings", "get", "default-web-browser"],
+                capture_output=True, text=True, timeout=5,
+            )
+            current = result.stdout.strip()
+            if current == "htmldispatch.desktop":
+                self.default_status_var.set("htmldispatch is the default browser")
+            else:
+                self.default_status_var.set(f"Default browser: {current}")
+        except Exception:
+            self.default_status_var.set("Could not detect default browser")
+
+    def _set_as_default(self):
+        import subprocess
+        for cmd in [
+            ["xdg-settings", "set", "default-web-browser", "htmldispatch.desktop"],
+            ["xdg-mime", "default", "htmldispatch.desktop", "x-scheme-handler/http"],
+            ["xdg-mime", "default", "htmldispatch.desktop", "x-scheme-handler/https"],
+        ]:
+            subprocess.run(cmd, capture_output=True, timeout=5)
+        self._check_default_browser()
 
     def _save_settings(self):
         self.config["popup_on_unknown"] = self.popup_var.get()
